@@ -78,3 +78,8 @@ governance/workspace-policy.constitution.json
 # El pin local del SHA del fichero activo: es estado del operador, y cambia
 # en cuanto la politica se instancia en otra maquina.
 governance/workspace-policy.constitution.json.sha256
+
+# Artefactos locales de revision para el gate del juez: son de esta maquina,
+# no del repo. Un `git add -A` sin cuidado los publicaria.
+pr-*-review-architectural.md
+pr-*-review-artifact.patch
