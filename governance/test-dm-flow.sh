@@ -20,6 +20,10 @@
 #   - el plan emite los 8 pasos en orden y lleva agent_id explicito
 #   - los artefactos versionados no llevan rutas del home del operador
 #   - el contrato fija el SHA del ejemplo, no el de una maquina
+#   - el verificador acepta una instancia recien creada y rechaza una
+#     manipulada, un pin que no cuadra y una constitution en un arbol de git
+#   - el verificador funciona SIN instancia activa (el modo del CI)
+#   - el gate rechaza una constitution que vive dentro de un arbol de git
 #
 # USO:  governance/test-dm-flow.sh
 # CODIGO: 0 todo verde · 1 algun fallo
@@ -145,6 +149,69 @@ example_sha="$(sha256sum "$SCRIPT_DIR/workspace-policy.constitution.example.json
 grep -q '<workspace_root>' "$SCRIPT_DIR/workspace-policy.constitution.example.json" \
   && ok "el ejemplo usa marcadores en lugar de rutas" \
   || bad "el ejemplo usa marcadores en lugar de rutas"
+
+# --- 11. el verificador: la instancia recien creada vale ---------------------
+# El verificador no tenia ni un test. Su comportamiento es contrato: el CI
+# lo ejecuta, y su exit code decide si el PR pasa.
+ACTIVE="$TMPROOT/activo.json"
+sed -e "s|<workspace_root>|$HOME/workspace|g" -e "s|<home_root>|$HOME|g" \
+  "$SCRIPT_DIR/workspace-policy.constitution.example.json" > "$ACTIVE"
+code="$(bash "$CHECK" --exige-activo "$ACTIVE" >/dev/null 2>&1; echo $?)"
+[ "$code" = "0" ] && ok "el verificador acepta la instancia recien creada" \
+                  || bad "el verificador acepta la instancia recien creada" "obtenido: $code"
+
+# --- 12. el verificador rechaza una instancia manipulada --------------------
+TAMPERED="$TMPROOT/activo-manipulado.json"
+sed -e 's|<workspace_root>|/otra/raiz|g' \
+  "$SCRIPT_DIR/workspace-policy.constitution.example.json" > "$TAMPERED"
+code="$(bash "$CHECK" --exige-activo "$TAMPERED" >/dev/null 2>&1; echo $?)"
+[ "$code" = "65" ] && ok "el verificador rechaza una instancia que no es el ejemplo" \
+                   || bad "el verificador rechaza una instancia que no es el ejemplo" "obtenido: $code"
+
+# --- 13. el verificador rechaza un pin que no cuadra ------------------------
+PINNED="$TMPROOT/activo-con-pin.json"
+cp "$ACTIVE" "$PINNED"
+printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$PINNED.sha256"
+code="$(bash "$CHECK" --exige-activo "$PINNED" >/dev/null 2>&1; echo $?)"
+[ "$code" = "65" ] && ok "el verificador rechaza un pin que no coincide" \
+                   || bad "el verificador rechaza un pin que no coincide" "obtenido: $code"
+
+# --- 14. el verificador rechaza una constitution en un arbol de git ---------
+GITTREE="$TMPROOT/repo-con-git"
+mkdir -p "$GITTREE/.git" "$GITTREE/governance"
+cp "$ACTIVE" "$GITTREE/governance/workspace-policy.constitution.json"
+code="$(bash "$CHECK" --exige-activo "$GITTREE/governance/workspace-policy.constitution.json" >/dev/null 2>&1; echo $?)"
+[ "$code" = "65" ] && ok "el verificador rechaza una constitution dentro de un arbol de git" \
+                   || bad "el verificador rechaza una constitution dentro de un arbol de git" "obtenido: $code"
+
+# --- 15. el verificador funciona SIN instancia activa (el modo del CI) ------
+# Un checkout limpio no tiene la forma activa: esta en .gitignore. El CI
+# ejecuta el verificador asi, y antes exigia un fichero que no puede existir
+# ahi: el job de governance estaba rojo por esto.
+CICHECK="$TMPROOT/ci/governance"
+mkdir -p "$CICHECK" "$TMPROOT/ci/constitutions"
+cp "$CHECK" "$CICHECK/"
+cp "$SCRIPT_DIR/workspace-policy.constitution.example.json" "$CICHECK/"
+cp "$REPO_ROOT/constitutions/dark-agents-workspace-policy.yaml" "$TMPROOT/ci/constitutions/"
+code="$(bash "$CICHECK/check-constitution.sh" >/dev/null 2>&1; echo $?)"
+[ "$code" = "0" ] && ok "el verificador pasa sin instancia activa (modo CI)" \
+                  || bad "el verificador pasa sin instancia activa (modo CI)" "obtenido: $code"
+
+code="$(bash "$CICHECK/check-constitution.sh" --exige-activo >/dev/null 2>&1; echo $?)"
+[ "$code" = "66" ] && ok "--exige-activo falla cuando no hay instancia" \
+                   || bad "--exige-activo falla cuando no hay instancia" "obtenido: $code"
+
+# --- 16. el gate rechaza una constitution dentro de un arbol de git ---------
+# El watchdog lee la constitution al abrir el store. Si el fichero vive en un
+# arbol que git puede cambiar, un checkout lo borra y el servidor arranca sin
+# store: no hay juez, y el pipeline se queda sin respuesta.
+WS3="$TMPROOT/workspace3"
+mkdir -p "$WS3/$PROJ/governance" "$WS3/$PROJ/.git"
+cp "$SCRIPT_DIR/workspace-policy.constitution.example.json" \
+   "$WS3/$PROJ/governance/workspace-policy.constitution.json"
+code="$(WORKSPACE="$WS3" bash "$FLOW" check "$PROJ" 25 >/dev/null 2>&1; echo $?)"
+[ "$code" = "65" ] && ok "el gate rechaza una constitution dentro de un arbol de git (WS-4 bis)" \
+                   || bad "el gate rechaza una constitution dentro de un arbol de git (WS-4 bis)" "obtenido: $code"
 
 echo
 echo "  $PASS PASS · $FAIL FAIL"

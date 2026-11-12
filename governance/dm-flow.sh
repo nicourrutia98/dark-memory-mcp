@@ -10,9 +10,9 @@
 #
 # Asi que este script NO invoca el MCP. Su trabajo es:
 #
-#   1. VALIDAR las reglas del workspace (WS-2, WS-3, WS-4) ANTES de que el
-#      agente gaste un solo token. El fallo barato se detecta antes del
-#      trabajo caro.
+#   1. VALIDAR las reglas del workspace (WS-2, WS-3, WS-4, WS-4 bis) ANTES de
+#      que el agente gaste un solo token. El fallo barato se detecta antes
+#      del trabajo caro.
 #   2. EMITIR el plan de llamadas MCP exactas, con los argumentos ya
 #      resueltos (session_id, constitution_id, artifact_ref con la ruta
 #      canonica). El agente las ejecuta con sus propias tools, donde el
@@ -48,7 +48,10 @@ CONSTITUTION_ID="${DARK_CONSTITUTION_ID:-dark-agents/workspace-policy}"
 #
 # Ahora se resuelve, por este orden:
 #   1. DARK_CONSTITUTION_FILE, si viene (es lo que cablea el MCP).
-#   2. <workspace>/<proyecto>/governance/..., si el proyecto la aloja.
+#   2. <workspace>/<proyecto>/governance/..., si el proyecto la aloja. Un
+#      ENLACE a un workspace de politica cuenta: es la forma recomendada,
+#      porque deja una sola copia en la maquina y el gate la encuentra
+#      donde la busca.
 #   3. El resto de constitutions de <workspace>/*/governance/, si hay una sola
 #      que sirva (la constitution puede ser compartida entre proyectos).
 # Y en cualquier caso: WS-4 se sigue exigiendo (una constitution en un
@@ -128,6 +131,26 @@ fi
 [[ "$CONSTITUTION_FILE" != /tmp/* && "$CONSTITUTION_FILE" != /var/tmp/* ]] || fail \
   "la constitution esta en un espacio temporal: $CONSTITUTION_FILE
   regla WS-4: la constitution vive en un workspace, no en un temporal." 65
+
+# WS-4 (bis): la constitution que gobierna el ARRANQUE del servidor no puede
+# vivir dentro de un arbol de git. Un checkout a una rama que no trae el
+# fichero lo borra; entonces el watchdog no puede leerlo, el store no abre y
+# NO HAY JUEZ. Se resuelve el enlace antes de mirar, porque un enlace a un
+# workspace de politica (que esta fuera de git) es la forma correcta.
+resolved_constitution="$(readlink -f "$CONSTITUTION_FILE" 2>/dev/null || echo "$CONSTITUTION_FILE")"
+git_root=""
+dir="$(dirname "$resolved_constitution")"
+while :; do
+  if [[ -e "$dir/.git" ]]; then git_root="$dir"; break; fi
+  [[ "$dir" == "$WORKSPACE" || "$dir" == "/" || "$dir" == "." || -z "$dir" ]] && break
+  dir="$(dirname "$dir")"
+done
+[[ -z "$git_root" ]] || fail \
+  "la constitution esta dentro de un arbol de git: $git_root
+  regla WS-4 (bis): la constitution que gobierna el ARRANQUE del servidor no
+  puede vivir en un arbol que git puede cambiar con un checkout.
+  muevela a un workspace de politica fuera de git y deja un enlace en
+  <workspace>/<proyecto>/governance/." 65
 if [[ -z "$CONSTITUTION_VER" ]]; then
   CONSTITUTION_VER="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
     "$CONSTITUTION_FILE" | head -1)"

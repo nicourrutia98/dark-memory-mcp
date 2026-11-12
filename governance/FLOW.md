@@ -10,9 +10,10 @@
 > (commit `ba1c29e`). Los números son observaciones, no recuerdos.
 
 La política que gobierna el flujo es la constitution del workspace
-(`workspace-policy.constitution.json`, que vive en el workspace del proyecto y
-aquí se versiona en su forma canónica
-[`workspace-policy.constitution.example.json`](./workspace-policy.constitution.example.json)).
+(`workspace-policy.constitution.json`), que **no vive en un checkout de git**:
+vive en un workspace de política propio, y cada proyecto la enlaza. Aquí se
+versiona solo su forma canónica
+[`workspace-policy.constitution.example.json`](./workspace-policy.constitution.example.json).
 
 ---
 
@@ -78,7 +79,7 @@ es una lectura local de SQLite. Reglas prácticas:
 
 | Capa | Dónde | Por qué |
 |---|---|---|
-| Reglas | `governance/workspace-policy.constitution.json` (workspace del operador; aquí versionada como `.example.json`) | Política del operador, por proyecto: SHA-pineada, viviendo en el workspace del proyecto (WS-4). No es un default del producto — mira `constitutions/` en [ARCHITECTURE-V4.md](../ARCHITECTURE-V4.md) para lo que sí shippea el producto. |
+| Reglas | `workspace-policy.constitution.json` en un **workspace de política** fuera de git (en cada proyecto, un enlace; aquí se versiona la forma canónica `.example.json`) | Política del operador: SHA-pineada y vigilada por el watchdog, pero **fuera de cualquier árbol de git**, porque de ella depende el arranque del servidor (§5.6). No es un default del producto — mira `constitutions/` en [ARCHITECTURE-V4.md](../ARCHITECTURE-V4.md) para lo que sí shippea el producto. |
 | Orquestación | `governance/dm-flow.sh` | Valida las reglas antes de gastar ningún token y luego emite el plan de llamadas. |
 | Decisiones | la base SQLite de dark-memory | Cruza sesiones y proyectos. |
 | Rastro | `write_audit` | Un write, una fila. |
@@ -152,6 +153,27 @@ eso la política del workspace es JSON.
 valida dónde se escribieron los ficheros. Lo que protege el disco son
 WS-2/WS-3, y por eso el pre-flight de `dm-flow.sh` los valida explícitamente:
 es la capa que el gate no cubre.
+
+### 5.6 Un fichero del que depende el arranque no puede vivir en un árbol de git
+
+El watchdog lee la constitution **al abrir el store**. Si ese fichero vive en
+un checkout de git, un `git checkout` a una rama que no lo trae lo borra, y
+entonces:
+
+1. el watchdog no puede leerlo y el store **no abre**;
+2. sin store no hay juez, ni `vibe_publish`, ni veredicto;
+3. el pipeline que levanta su propio servidor se queda sin respuesta.
+
+Medido el 2026-11-12: un `git checkout` a otra rama se llevó el directorio
+`governance/` entero, y con él la constitution. El síntoma visible fue
+`EL PIPELINE NO PUDO CORRER: initialize: el servidor terminó con código 1`,
+que señalaba un problema que estaba tres commits más allá.
+
+De ahí **WS-4 bis**: la constitution resuelta no puede residir dentro de un
+árbol de git. Lo hacen cumplir `dm-flow.sh` (pre-flight, código 65) y
+`check-constitution.sh` (verificación, código 65). Los dos **resuelven el
+enlace antes de mirar**, así que un enlace a un workspace de política —que está
+fuera de git— es la forma correcta, y un proyecto puede tener el suyo.
 
 ---
 

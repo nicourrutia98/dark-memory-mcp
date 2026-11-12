@@ -66,10 +66,13 @@ opencode.jsonc
 
 
 # Politica de workspace del operador (governance/): la constitution ACTIVA es
-# un artefacto del operador, por proyecto, no un fichero del producto. Vive
-# en el workspace del proyecto y aqui se versiona su forma canonica
-# (.example.json); ver governance/README.md. El watchdog hace el pin por SHA
-# del fichero activo.
+# un artefacto del operador, por proyecto, no un fichero del producto. No
+# vive en este checkout: vive en un workspace de politica FUERA de git,
+# porque de ella depende el arranque del servidor y un checkout a otra rama
+# se la llevaria (ver governance/README.md y governance/FLOW.md 5.6). Aqui se
+# versiona su forma canonica (.example.json) y el watchdog hace el pin por
+# SHA del fichero activo. En un proyecto, este nombre es un ENLACE a esa
+# copia: el enlace lleva la ruta del operador, asi que tampoco se versiona.
 governance/workspace-policy.constitution.json
 
 # El pin local del SHA del fichero activo: es estado del operador, y cambia
