@@ -338,7 +338,16 @@ func (s *Store) ResolveErrorEvent(ctx context.Context, wc store.WriteContext, id
 	if err := s.requireProject(); err != nil {
 		return err
 	}
-	projectID := projectIDOrActive(wc.ProjectID, s.activeProject)
+	// SPEC-204: el proyecto viene de la SESION que pide la operacion, no
+	// del slot global. Con el slot en otro proyecto, resolver un error
+	// fallaba con "row not found" y el error se quedaba sin resolver.
+	projectID, projErr := s.resolveWriteProject(ctx, wc)
+	if projErr != nil {
+		return projErr
+	}
+	if projectID == "" {
+		projectID = projectIDOrActive(wc.ProjectID, s.activeProject)
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
 	s.mu.Lock()

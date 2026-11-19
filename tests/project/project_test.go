@@ -672,9 +672,33 @@ func TestProject_ListSessions_CrossProject_Isolated(t *testing.T) {
 }
 
 // W3-002 (T4a): CloseSession must require the session to belong to the
-// active project. Cross-project close attempts return ErrNotFound and
-// do NOT mutate the row.
-func TestProject_CloseSession_CrossProject_NotClosed(t *testing.T) {
+// the slot decides. That was the OLD model, and SPEC-204 §10 changed it
+// DELIBERATELY:
+//
+//	"Al resolver la sesión por id y no por el proyecto activo, nombrar la
+//	 sesión de otro proyecto pasa a ser una identidad válida para las 78
+//	 tools. Antes se rechazaba ('identity unavailable for this session')."
+//
+// The session id IS the credential (SPEC-204 §10: 128 bits of entropy,
+// ListSessions filtered by project, and the id is not accepted from an
+// untrusted caller). So a close that NAMES a session closes THAT session,
+// and the global slot — a single mutable shared by every client of the MCP
+// process — has no say in it.
+//
+// WHY THIS TEST CHANGED AND NOT JUST ITS EXPECTATION. The old version
+// asserted that a close from another project fails. That assertion encoded
+// the pre-SPEC-204 model, and it was ALSO the production bug: with the slot
+// moved by another session, a session could not be closed at all, and the
+// Error Observatory filled with "identity unavailable for this session"
+// (MEDIDO 2026-11-18: 8 sessions stuck open).
+//
+// What SURVIVES of the old intent, and is now asserted STRONGER:
+//
+//  1. The close touches the named session and NOTHING else.
+//  2. The audit row of the close lands in the session's OWN project — the
+//     multi-tenant guarantee that actually holds.
+//  3. A session that does not exist is still ErrNotFound.
+func TestProject_CloseSession_ScopedToTheNamedSession(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 
@@ -690,18 +714,23 @@ func TestProject_CloseSession_CrossProject_NotClosed(t *testing.T) {
 		&session.Session{SessionID: "sess-A", Status: string(session.StatusOpen)}); err != nil {
 		t.Fatalf("save A: %v", err)
 	}
-
-	// Try to close from globex.
+	// A second session of the OTHER project, to prove the close does not
+	// touch it.
 	s.SetActiveProject(ctx, "globex")
-	err := s.CloseSession(ctx, store.WriteContext{Actor: "test", SessionID: "sess-A", WritePath: "test", ProjectID: "globex"}, "sess-A", "clean")
-	if err == nil {
-		t.Fatalf("expected error closing cross-project session, got nil")
-	}
-	if !errIs(err, store.ErrNotFound) {
-		t.Fatalf("expected ErrNotFound, got: %v", err)
+	if _, err := s.SaveSession(ctx, store.WriteContext{Actor: "test", SessionID: "sess-G", WritePath: "test", ProjectID: "globex"},
+		&session.Session{SessionID: "sess-G", Status: string(session.StatusOpen)}); err != nil {
+		t.Fatalf("save G: %v", err)
 	}
 
-	// Switch back to A and confirm sess-A is still active.
+	// The slot is on globex — another session moved it. The close names
+	// sess-A, so it closes sess-A.
+	s.SetActiveProject(ctx, "globex")
+	if err := s.CloseSession(ctx, store.WriteContext{Actor: "test", SessionID: "sess-A", WritePath: "test", ProjectID: "globex"},
+		"sess-A", "clean"); err != nil {
+		t.Fatalf("CloseSession(sess-A) con el slot en otro proyecto: %v; el slot no gobierna una operacion que nombra la sesion (SPEC-204 §10)", err)
+	}
+
+	// 1. sess-A is closed...
 	s.SetActiveProject(ctx, "acme")
 	got, err := s.GetSession(ctx, "sess-A")
 	if err != nil {
@@ -710,8 +739,45 @@ func TestProject_CloseSession_CrossProject_NotClosed(t *testing.T) {
 	if got == nil {
 		t.Fatalf("sess-A disappeared")
 	}
-	if got.Status != string(session.StatusOpen) {
-		t.Fatalf("sess-A was closed by cross-project attempt, status=%s", got.Status)
+	if got.Status != string(session.StatusClosedClean) {
+		t.Fatalf("sess-A no quedo cerrada, status=%s", got.Status)
+	}
+
+	// ...and sess-G, of the other project, is untouched.
+	s.SetActiveProject(ctx, "globex")
+	gotG, err := s.GetSession(ctx, "sess-G")
+	if err != nil {
+		t.Fatalf("GetSession(sess-G): %v", err)
+	}
+	if gotG == nil {
+		t.Fatalf("sess-G disappeared: el cierre de sess-A toco otra sesion")
+	}
+	if gotG.Status != string(session.StatusOpen) {
+		t.Fatalf("sess-G fue cerrada por el cierre de sess-A, status=%s", gotG.Status)
+	}
+
+	// 2. The audit row of the close lands in ACME (the session's project),
+	//    NOT in the slot's project. This is the multi-tenant guarantee.
+	// La fila de auditoria del cierre: la ultima de la tabla sessions para
+	// esa sesion. El write_path es el que puso el llamante, no el metodo.
+	var auditProject string
+	err = s.RawDB().QueryRowContext(ctx,
+		`SELECT project_id FROM write_audit WHERE table_name = 'sessions' AND session_id = 'sess-A'
+		 ORDER BY id DESC LIMIT 1`).Scan(&auditProject)
+	if err != nil {
+		t.Fatalf("leer la fila de auditoria del cierre: %v", err)
+	}
+	if auditProject != "acme" {
+		t.Fatalf("la fila de auditoria del cierre esta en el proyecto %q, se esperaba \"acme\": el rastro de un proyecto no puede aterrizar en otro", auditProject)
+	}
+
+	// 3. A session that does not exist is still ErrNotFound.
+	s.SetActiveProject(ctx, "acme")
+	if err := s.CloseSession(ctx, store.WriteContext{Actor: "test", SessionID: "sess-inexistente", WritePath: "test"},
+		"sess-inexistente", "clean"); err == nil {
+		t.Fatalf("CloseSession de una sesion inexistente devolvio nil, se esperaba error")
+	} else if !errIs(err, store.ErrNotFound) {
+		t.Fatalf("CloseSession de una sesion inexistente: %v, se esperaba ErrNotFound", err)
 	}
 }
 

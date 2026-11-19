@@ -765,6 +765,20 @@ type AgentMemoryDelegateInput struct {
 	Operator        string `json:"operator"`
 	SubagentID      string `json:"subagent_id"`
 	TaskDescription string `json:"task_description"`
+	// SessionID is the session that asks for the delegation. SPEC-203/204:
+	// the project of the delegation — the curated context, the C2 binding,
+	// the audit rows — is resolved from THIS session, not from the mutable
+	// global slot.
+	//
+	// MEDIDO 2026-11-18: without it, the delegation context of a session
+	// in one project was curated from ANOTHER project, because the slot had
+	// been moved by another client of the same MCP process. The context
+	// even carried the wrong header (the name of a project that had
+	// nothing to do with the session asking for it).
+	//
+	// Optional: when empty, the active session of the active project is
+	// used (the last resort of the chain, per SPEC-204 §8).
+	SessionID string `json:"session_id,omitempty"`
 	// IncludePinned / IncludeTodos are *bool so "unset" (default
 	// true, per the tool schema) is distinguishable from an explicit
 	// false. Zero-value bool would silently disable both sections
@@ -845,16 +859,40 @@ func (o *Orchestrator) AgentMemoryDelegate(ctx context.Context, in AgentMemoryDe
 		return nil, errMissingField("task_description")
 	}
 
-	// Active project + session required. The gate enforces this on
-	// the wire (RequiresActiveSession default); the explicit check
-	// keeps direct-orchestrator test paths honest.
-	projID := o.Store.ActiveProject()
-	if projID == "" {
-		return nil, fmt.Errorf("agent_memory_delegate: %w: no active project", store.ErrInvalidState)
+	// LA SESION Y EL PROYECTO DE LA DELEGACION.
+	//
+	// La sesion es la autoridad (SPEC-204 §10): el contexto curado, el
+	// binding C2 y las filas de auditoria tienen que caer en el proyecto
+	// de la sesion que pide la delegacion, no en el del slot global — un
+	// unico mutable compartido por todos los clientes del proceso MCP.
+	//
+	// MEDIDO 2026-11-18: con el slot en otro proyecto, el contexto de
+	// delegacion de una sesion venia del proyecto ajeno.
+	//
+	// Cuando la sesion no se nombra, se cae a la sesion activa del
+	// proyecto activo: el ultimo recurso de la cadena (SPEC-204 §8), no
+	// el primero.
+	sessID := strings.TrimSpace(in.SessionID)
+	var projID string
+	if sessID != "" {
+		p, err := o.resolveCallProject(ctx, "", sessID)
+		if err != nil {
+			return nil, fmt.Errorf("agent_memory_delegate: resolve project: %w", err)
+		}
+		projID = p
 	}
-	sessID, err := o.Store.GetActiveSession(ctx, projID)
-	if err != nil || sessID == "" {
-		return nil, fmt.Errorf("agent_memory_delegate: %w: no active session", store.ErrInvalidState)
+	if projID == "" {
+		projID = o.Store.ActiveProject()
+		if projID == "" {
+			return nil, fmt.Errorf("agent_memory_delegate: %w: no active project", store.ErrInvalidState)
+		}
+	}
+	if sessID == "" {
+		active, err := o.Store.GetActiveSession(ctx, projID)
+		if err != nil || active == "" {
+			return nil, fmt.Errorf("agent_memory_delegate: %w: no active session", store.ErrInvalidState)
+		}
+		sessID = active
 	}
 
 	// Resolve parent agent_id (the principal's identity at spawn

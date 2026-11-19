@@ -1461,6 +1461,7 @@ func (s *Store) SaveSession(ctx context.Context, wc store.WriteContext, sess *se
 		sess.ID = id
 		return s.recordWriteTx(ctx, tx, audit.WriteEvent{
 			TableName:       "sessions",
+			ProjectID:       projectID,
 			RowID:           id,
 			Actor:           wc.Actor,
 			SessionID:       sess.SessionID,
@@ -1630,6 +1631,62 @@ func (s *Store) GetSession(ctx context.Context, sessionID string) (*session.Sess
 	return &sess, nil
 }
 
+// GetSessionInProject is the project-scoped read: it does NOT depend on the
+// mutable active-project slot, so a caller that knows the project of the
+// session can read it back even when another client has moved the slot.
+//
+// It is IMPLEMENTED, not a stub: GetSession (the slot-scoped read) is
+// implemented in this driver too, and session_close reads the session back
+// after closing it. A stub here would have made session_close fail on every
+// postgres deployment with "not implemented" — a regression introduced by
+// the fix that the fix was supposed to remove.
+//
+//   - Row in the requested project -> (*Session, nil)
+//   - Row in a different project   -> (nil, nil)
+//   - Row does not exist           -> (nil, nil)
+func (s *Store) GetSessionInProject(ctx context.Context, projectID, sessionID string) (*session.Session, error) {
+	if err := s.requireProject(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, nil
+	}
+	if projectID == "" {
+		projectID = s.activeProject
+	}
+	var sess session.Session
+	var closedAt, heartbeat, parent, rescFrom, notes *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, session_id, status, constitution_id, constitution_ver, active_mods,
+		        operator, started_at, closed_at, last_heartbeat_at,
+		        parent_session_id, resurrected_from, notes
+		 FROM sessions WHERE session_id = $1 AND project_id = $2`, sessionID, projectID).Scan(
+		&sess.ID, &sess.SessionID, &sess.Status, &sess.ConstitutionID, &sess.ConstitutionVer, &sess.ActiveMods,
+		&sess.Operator, &sess.StartedAt, &closedAt, &heartbeat, &parent, &rescFrom, &notes)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if closedAt != nil {
+		sess.ClosedAt = *closedAt
+	}
+	if heartbeat != nil {
+		sess.LastHeartbeatAt = *heartbeat
+	}
+	if parent != nil {
+		sess.ParentSessionID = *parent
+	}
+	if rescFrom != nil {
+		sess.ResurrectedFrom = *rescFrom
+	}
+	if notes != nil {
+		sess.Notes = *notes
+	}
+	return &sess, nil
+}
+
 func (s *Store) CloseSession(ctx context.Context, wc store.WriteContext, sessionID, reason string) error {
 	if err := s.requireProject(); err != nil {
 		return err
@@ -1640,13 +1697,21 @@ func (s *Store) CloseSession(ctx context.Context, wc store.WriteContext, session
 	}
 	dest := reasonClose.DestinationStatus()
 	sessionEvent := session.SessionEventForReason(reasonClose)
-	activeProject := s.activeProject // capture before locking
+	// SPEC-204: the project of a write comes from the SESSION that asked
+	// for it, not from the mutable global slot. The slot is shared by every
+	// client of this MCP process, so another session moving it used to
+	// redirect this write to another project (or to no project at all).
+	// Resolved BEFORE the lock: resolveWriteProject takes it too.
+	projectID, projErr := s.resolveWriteProject(ctx, wc)
+	if projErr != nil {
+		return projErr
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	return s.runInTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx,
 			`UPDATE sessions SET status = $1, closed_at = $2
 			 WHERE session_id = $3 AND project_id = $4 AND status IN ('open','idle')`,
-			string(dest), now, sessionID, activeProject)
+			string(dest), now, sessionID, projectID)
 		if err != nil {
 			return err
 		}
@@ -1655,6 +1720,7 @@ func (s *Store) CloseSession(ctx context.Context, wc store.WriteContext, session
 		}
 		return s.recordWriteTx(ctx, tx, audit.WriteEvent{
 			TableName:       "sessions",
+			ProjectID:       projectID,
 			Actor:           wc.Actor,
 			SessionID:       sessionID,
 			WritePath:       wc.WritePath,
@@ -1672,13 +1738,21 @@ func (s *Store) SaveHeartbeat(ctx context.Context, wc store.WriteContext, sessio
 	if err := s.requireProject(); err != nil {
 		return err
 	}
-	activeProject := s.activeProject // capture before locking
+	// SPEC-204: the project of a write comes from the SESSION that asked
+	// for it, not from the mutable global slot. The slot is shared by every
+	// client of this MCP process, so another session moving it used to
+	// redirect this write to another project (or to no project at all).
+	// Resolved BEFORE the lock: resolveWriteProject takes it too.
+	projectID, projErr := s.resolveWriteProject(ctx, wc)
+	if projErr != nil {
+		return projErr
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	return s.runInTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx,
 			`UPDATE sessions SET last_heartbeat_at = $1
 			 WHERE session_id = $2 AND project_id = $3 AND status IN ('open','idle')`,
-			now, sessionID, activeProject)
+			now, sessionID, projectID)
 		if err != nil {
 			return err
 		}
@@ -1687,6 +1761,7 @@ func (s *Store) SaveHeartbeat(ctx context.Context, wc store.WriteContext, sessio
 		}
 		return s.recordWriteTx(ctx, tx, audit.WriteEvent{
 			TableName:       "sessions",
+			ProjectID:       projectID,
 			Actor:           wc.Actor,
 			SessionID:       sessionID,
 			WritePath:       wc.WritePath,
@@ -1761,7 +1836,15 @@ func (s *Store) SaveResurrect(ctx context.Context, wc store.WriteContext, origin
 	if !session.Status(original.Status).IsResurrectable() && session.Status(original.Status) != session.StatusIdle {
 		return nil, fmt.Errorf("store: SaveResurrect: original status %q is not resurrectable", original.Status)
 	}
-	activeProject := s.activeProject
+	// SPEC-204: the project of a write comes from the SESSION that asked
+	// for it, not from the mutable global slot. The slot is shared by every
+	// client of this MCP process, so another session moving it used to
+	// redirect this write to another project (or to no project at all).
+	// Resolved BEFORE the lock: resolveWriteProject takes it too.
+	projectID, projErr := s.resolveWriteProject(ctx, wc)
+	if projErr != nil {
+		return nil, projErr
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	rescFrom := original.ResurrectedFrom
 	if rescFrom == "" {
@@ -1798,7 +1881,7 @@ func (s *Store) SaveResurrect(ctx context.Context, wc store.WriteContext, origin
 			newSess.ActiveMods, newSess.StartedAt, newSess.LastHeartbeatAt,
 			closedAt,
 			newSess.ParentSessionID, newSess.ResurrectedFrom, newSess.Notes,
-			newSess.Operator, activeProject,
+			newSess.Operator, projectID,
 			newSess.StartedAt, /* created_at proxy = started_at for resurrected sessions */
 		).Scan(&newID); err != nil {
 			return err
@@ -1806,6 +1889,7 @@ func (s *Store) SaveResurrect(ctx context.Context, wc store.WriteContext, origin
 		newSess.ID = newID
 		return s.recordWriteTx(ctx, tx, audit.WriteEvent{
 			TableName:       "sessions",
+			ProjectID:       projectID,
 			Actor:           wc.Actor,
 			SessionID:       newSess.SessionID,
 			WritePath:       wc.WritePath,
@@ -1931,13 +2015,21 @@ func (s *Store) PromoteSessionStatus(ctx context.Context, wc store.WriteContext,
 	if err := s.requireProject(); err != nil {
 		return err
 	}
-	activeProject := s.activeProject
+	// SPEC-204: the project of a write comes from the SESSION that asked
+	// for it, not from the mutable global slot. The slot is shared by every
+	// client of this MCP process, so another session moving it used to
+	// redirect this write to another project (or to no project at all).
+	// Resolved BEFORE the lock: resolveWriteProject takes it too.
+	projectID, projErr := s.resolveWriteProject(ctx, wc)
+	if projErr != nil {
+		return projErr
+	}
 	var currentStatus string
 	var rowID int64
 	err := s.runInTx(ctx, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx,
 			`SELECT id, status FROM sessions WHERE session_id = $1 AND project_id = $2`,
-			sessionID, activeProject).Scan(&rowID, &currentStatus); err != nil {
+			sessionID, projectID).Scan(&rowID, &currentStatus); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return store.ErrNotFound
 			}
@@ -1948,11 +2040,12 @@ func (s *Store) PromoteSessionStatus(ctx context.Context, wc store.WriteContext,
 		}
 		if _, err := tx.Exec(ctx,
 			`UPDATE sessions SET status = $1 WHERE session_id = $2 AND project_id = $3`,
-			newStatus, sessionID, activeProject); err != nil {
+			newStatus, sessionID, projectID); err != nil {
 			return err
 		}
 		return s.recordWriteTx(ctx, tx, audit.WriteEvent{
 			TableName:       "sessions",
+			ProjectID:       projectID,
 			RowID:           rowID,
 			Actor:           wc.Actor,
 			SessionID:       sessionID,
@@ -2333,6 +2426,7 @@ func (s *Store) LinkResearch(ctx context.Context, wc store.WriteContext, link *r
 		link.ID = id
 		return s.recordWriteTx(ctx, tx, audit.WriteEvent{
 			TableName:       "research_links",
+			ProjectID:       projectID,
 			RowID:           id,
 			Actor:           wc.Actor,
 			SessionID:       wc.SessionID,
@@ -2439,6 +2533,7 @@ func (s *Store) SaveBrandGuide(ctx context.Context, wc store.WriteContext, b *vi
 		}
 		return s.recordWriteTx(ctx, tx, audit.WriteEvent{
 			TableName:       "vibe_brands",
+			ProjectID:       projectID,
 			Actor:           wc.Actor,
 			SessionID:       wc.SessionID,
 			WritePath:       wc.WritePath,
@@ -2492,7 +2587,15 @@ func (s *Store) DeleteBrandGuide(ctx context.Context, wc store.WriteContext, bra
 	if err := s.requireProject(); err != nil {
 		return err
 	}
-	activeProject := s.ActiveProject()
+	// SPEC-204: the project of a write comes from the SESSION that asked
+	// for it, not from the mutable global slot. The slot is shared by every
+	// client of this MCP process, so another session moving it used to
+	// redirect this write to another project (or to no project at all).
+	// Resolved BEFORE the lock: resolveWriteProject takes it too.
+	projectID, projErr := s.resolveWriteProject(ctx, wc)
+	if projErr != nil {
+		return projErr
+	}
 	// Path-safety: reject brand_id with characters that could escape
 	// into other SQL or filesystem paths (mirror of sqlite/store.go:1891).
 	if strings.ContainsAny(brandID, "/\\\x00\n\r") {
@@ -2501,7 +2604,7 @@ func (s *Store) DeleteBrandGuide(ctx context.Context, wc store.WriteContext, bra
 	return s.runInTx(ctx, func(tx pgx.Tx) error {
 		res, err := tx.Exec(ctx,
 			`DELETE FROM vibe_brands WHERE brand_id = $1 AND project_id = $2`,
-			brandID, activeProject)
+			brandID, projectID)
 		if err != nil {
 			return err
 		}
@@ -2510,13 +2613,14 @@ func (s *Store) DeleteBrandGuide(ctx context.Context, wc store.WriteContext, bra
 		}
 		return s.recordWriteTx(ctx, tx, audit.WriteEvent{
 			TableName:       "vibe_brands",
+			ProjectID:       projectID,
 			Actor:           wc.Actor,
 			SessionID:       wc.SessionID,
 			WritePath:       wc.WritePath,
 			ConstitutionID:  wc.ConstitutionID,
 			ConstitutionVer: wc.ConstitutionVer,
 			CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
-			Notes:           "brand_id=" + brandID + " project_id=" + activeProject,
+			Notes:           "brand_id=" + brandID + " project_id=" + projectID,
 		}, "")
 	})
 }
@@ -2844,7 +2948,15 @@ func (s *Store) RecordModLoad(ctx context.Context, wc store.WriteContext, load *
 	if err := s.requireProject(); err != nil {
 		return 0, err
 	}
-	projectID := s.activeProject
+	// SPEC-204: the project of a write comes from the SESSION that asked
+	// for it, not from the mutable global slot. The slot is shared by every
+	// client of this MCP process, so another session moving it used to
+	// redirect this write to another project (or to no project at all).
+	// Resolved BEFORE the lock: resolveWriteProject takes it too.
+	projectID, projErr := s.resolveWriteProject(ctx, wc)
+	if projErr != nil {
+		return 0, projErr
+	}
 	if load.LoadedAt == "" {
 		load.LoadedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
@@ -2866,6 +2978,7 @@ func (s *Store) RecordModLoad(ctx context.Context, wc store.WriteContext, load *
 		id = insertedID
 		return s.recordWriteTx(ctx, tx, audit.WriteEvent{
 			TableName:       "mod_loads",
+			ProjectID:       projectID,
 			RowID:           insertedID,
 			Actor:           wc.Actor,
 			SessionID:       load.SessionID,
@@ -3233,6 +3346,15 @@ func (s *Store) SaveFrame(ctx context.Context, wc store.WriteContext, env *atomi
 	if env.CreatedAt.IsZero() {
 		env.CreatedAt = time.Now().UTC()
 	}
+	// SPEC-204: the project of a write comes from the SESSION that asked
+	// for it, not from the mutable global slot. The slot is shared by every
+	// client of this MCP process, so another session moving it used to
+	// redirect this write to another project (or to no project at all).
+	// Resolved BEFORE the lock: resolveWriteProject takes it too.
+	projectID, projErr := s.resolveWriteProject(ctx, wc)
+	if projErr != nil {
+		return 0, projErr
+	}
 	shaHex := fmt.Sprintf("%x", env.ContentSHA256)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	var id int64
@@ -3258,7 +3380,7 @@ func (s *Store) SaveFrame(ctx context.Context, wc store.WriteContext, env *atomi
 			   composed_at    = excluded.composed_at,
 			   created_at     = excluded.created_at
 			 RETURNING id`,
-			s.activeProject, env.SessionID, env.ScopeLevel, env.ScopeID, env.Kind,
+			projectID, env.SessionID, env.ScopeLevel, env.ScopeID, env.Kind,
 			env.ComposedAt.UTC().Format(time.RFC3339Nano),
 			env.ExpiresAt.UTC().Format(time.RFC3339Nano),
 			string(env.FrameJSON), shaHex, env.LastWriteID,
@@ -3270,6 +3392,7 @@ func (s *Store) SaveFrame(ctx context.Context, wc store.WriteContext, env *atomi
 		env.ID = id
 		return s.recordWriteTx(ctx, tx, audit.WriteEvent{
 			TableName:       "vibe_frames",
+			ProjectID:       projectID,
 			Actor:           wc.Actor,
 			SessionID:       env.SessionID,
 			WritePath:       "SaveFrame",
@@ -3430,6 +3553,15 @@ func (s *Store) SaveRecallSubscription(ctx context.Context, wc store.WriteContex
 		return 0, fmt.Errorf("postgres: SaveRecallSubscription: missing key fields (session_id=%q scope_level=%q scope_id=%q)",
 			sub.SessionID, sub.ScopeLevel, sub.ScopeID)
 	}
+	// SPEC-204: the project of a write comes from the SESSION that asked
+	// for it, not from the mutable global slot. The slot is shared by every
+	// client of this MCP process, so another session moving it used to
+	// redirect this write to another project (or to no project at all).
+	// Resolved BEFORE the lock: resolveWriteProject takes it too.
+	projectID, projErr := s.resolveWriteProject(ctx, wc)
+	if projErr != nil {
+		return 0, projErr
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	sub.CreatedAt = now
 	sub.UpdatedAt = now
@@ -3443,7 +3575,7 @@ func (s *Store) SaveRecallSubscription(ctx context.Context, wc store.WriteContex
 			 SET last_seen_token = EXCLUDED.last_seen_token,
 			     updated_at = EXCLUDED.updated_at
 			 RETURNING id`,
-			s.activeProject, sub.SessionID, sub.ScopeLevel, sub.ScopeID,
+			projectID, sub.SessionID, sub.ScopeLevel, sub.ScopeID,
 			sub.LastSeenToken, sub.CreatedAt, sub.UpdatedAt,
 		).Scan(&id)
 		if err != nil {
@@ -3452,6 +3584,7 @@ func (s *Store) SaveRecallSubscription(ctx context.Context, wc store.WriteContex
 		sub.ID = id
 		return s.recordWriteTx(ctx, tx, audit.WriteEvent{
 			TableName:       "vibe_recall_subscriptions",
+			ProjectID:       projectID,
 			Actor:           wc.Actor,
 			SessionID:       sub.SessionID,
 			WritePath:       "SaveRecallSubscription",
@@ -3500,13 +3633,22 @@ func (s *Store) UpdateRecallSubscriptionLastSeenToken(ctx context.Context, wc st
 		return fmt.Errorf("postgres: UpdateRecallSubscriptionLastSeenToken: missing key (session_id=%q scope=%q scope_id=%q)",
 			sessionID, scope, scopeID)
 	}
+	// SPEC-204: the project of a write comes from the SESSION that asked
+	// for it, not from the mutable global slot. The slot is shared by every
+	// client of this MCP process, so another session moving it used to
+	// redirect this write to another project (or to no project at all).
+	// Resolved BEFORE the lock: resolveWriteProject takes it too.
+	projectID, projErr := s.resolveWriteProject(ctx, wc)
+	if projErr != nil {
+		return projErr
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	return s.runInTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx,
 			`UPDATE vibe_recall_subscriptions
 			 SET last_seen_token = $1, updated_at = $2
 			 WHERE project_id = $3 AND session_id = $4 AND scope_level = $5 AND scope_id = $6`,
-			newToken, now, s.activeProject, sessionID, scope, scopeID)
+			newToken, now, projectID, sessionID, scope, scopeID)
 		if err != nil {
 			return err
 		}
@@ -3515,6 +3657,7 @@ func (s *Store) UpdateRecallSubscriptionLastSeenToken(ctx context.Context, wc st
 		}
 		return s.recordWriteTx(ctx, tx, audit.WriteEvent{
 			TableName:       "vibe_recall_subscriptions",
+			ProjectID:       projectID,
 			Actor:           wc.Actor,
 			SessionID:       sessionID,
 			WritePath:       "UpdateRecallSubscriptionLastSeenToken",
@@ -3632,6 +3775,7 @@ func (s *Store) saveVLPStateTx(ctx context.Context, wc store.WriteContext, row *
 		}
 		if err := s.recordWriteTx(ctx, tx, audit.WriteEvent{
 			TableName:       "vlp_state",
+			ProjectID:       projectID,
 			RowID:           id,
 			Actor:           wc.Actor,
 			SessionID:       row.SessionID,
@@ -3647,6 +3791,7 @@ func (s *Store) saveVLPStateTx(ctx context.Context, wc store.WriteContext, row *
 		if transitionNotes != "" {
 			if err := s.recordWriteTx(ctx, tx, audit.WriteEvent{
 				TableName:       "vlp_state",
+				ProjectID:       projectID,
 				RowID:           id,
 				Actor:           wc.Actor,
 				SessionID:       row.SessionID,

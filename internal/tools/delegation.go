@@ -172,6 +172,7 @@ func registerV2(reg *Registry, orch *orchestration.Orchestrator, st store.Store)
 					"type":        "string",
 					"description": "Operator id for audit trail (INV-1). Defaults to the active session's operator.",
 				},
+				"session_id": map[string]any{"type": "string", "description": "Session id (from session_start). SPEC-203/204: the project of the delegation is resolved from this session, so the context and the bindings land in the project of the session that asked for it even when another client moved the global project slot. Optional."},
 			},
 		}),
 		func(ctx context.Context, in orchestration.DelegateIntentInput) (*orchestration.DelegateIntentOutput, error) {
@@ -208,6 +209,7 @@ func registerV4Alpha(reg *Registry, backend *DelegateIntentBackend) {
 					"type":        "string",
 					"description": "Operator id (INV-1 audit owner). Empty defaults to orchestrator_delegate.",
 				},
+				"session_id": map[string]any{"type": "string", "description": "Session id (from session_start). SPEC-203/204: the project of the delegation is resolved from this session, so the context and the bindings land in the project of the session that asked for it even when another client moved the global project slot. Optional."},
 				"parent_session_id": map[string]any{
 					"type":        "string",
 					"description": "Optional parent session id (CURATE subagent binding). Empty when outside a session context.",

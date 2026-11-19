@@ -43,7 +43,20 @@ func (o *Orchestrator) RecordError(ctx context.Context, toolName, sessionID stri
 		log.Printf("dark-mem-mcp: RecordError(%s): no store; dropping err=%v", toolName, err)
 		return
 	}
-	e := errorobs.New(o.Store.ActiveProject(), sessionID, toolName, err)
+	// EL PROYECTO DEL ERROR: el de la sesion que lo produjo.
+	//
+	// MEDIDO 2026-11-18: con el slot global en otro proyecto, los errores
+	// de una sesion se guardaban en el proyecto ajeno, y el Error Observatory
+	// de un proyecto no mostraba los errores que letois pasaban. La sesion
+	// es la autoridad (SPEC-204 §10); el slot es el ultimo recurso de la
+	// cadena, no el primero.
+	projID := o.Store.ActiveProject()
+	if sessionID != "" {
+		if p, err := o.Store.ProjectIDForSession(ctx, sessionID); err == nil && p != "" {
+			projID = p
+		}
+	}
+	e := errorobs.New(projID, sessionID, toolName, err)
 	if severity != "" {
 		e = e.WithSeverity(severity)
 	}

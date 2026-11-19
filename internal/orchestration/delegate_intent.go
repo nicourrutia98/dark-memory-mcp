@@ -45,6 +45,13 @@ type DelegateIntentInput struct {
 	VibeCase        string `json:"vibe_case"`
 	TaskDescription string `json:"task_description"`
 	Operator        string `json:"operator,omitempty"`
+	// SessionID is the session that asks for the delegation. SPEC-203/204:
+	// the project of the delegation (the curated context, the subagent
+	// bindings) is resolved from THIS session, not from the mutable global
+	// slot. MEDIDO 2026-11-18: without it, the delegation context of a
+	// session in one project came from another project, because the slot had
+	// been moved by another client of the same MCP process.
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // DelegateSubTaskOutput is one ready-to-spawn unit of the plan:
@@ -160,10 +167,17 @@ func (o *Orchestrator) DelegateIntent(ctx context.Context, in DelegateIntentInpu
 		return nil, err
 	}
 
-	// Active project + session required (same contract as
-	// agent_memory_delegate; the gate enforces it on the wire, this
-	// check keeps direct-orchestrator test paths honest).
-	projID := o.Store.ActiveProject()
+	// EL PROYECTO DE LA DELEGACION: el de la sesion que la pide.
+	//
+	// MEDIDO 2026-11-18: con el slot global en otro proyecto, el contexto
+	// de delegacion de una sesion venia del proyecto ajeno — el contexto
+	// generado llevaba el nombre de OTRO proyecto en su cabecera — y el
+	// binding C2 se registraba alli. La sesion es la autoridad
+	// (SPEC-204 §10).
+	projID, err := o.resolveCallProject(ctx, "", in.SessionID)
+	if err != nil {
+		return nil, fmt.Errorf("delegate_intent: resolve project: %w", err)
+	}
 	if projID == "" {
 		return nil, fmt.Errorf("delegate_intent: %w: no active project", store.ErrInvalidState)
 	}
@@ -200,7 +214,7 @@ func (o *Orchestrator) DelegateIntent(ctx context.Context, in DelegateIntentInpu
 			return nil, fmt.Errorf("delegate_intent: router returned invalid plan: %w", err)
 		}
 		for _, st := range decision.Plan.Subtasks {
-			sub, err := o.prepareSubTask(ctx, st, operator)
+			sub, err := o.prepareSubTask(ctx, st, operator, in.SessionID)
 			if err != nil {
 				return nil, fmt.Errorf("delegate_intent: prepare subtask %q: %w", st.ID, err)
 			}
@@ -223,7 +237,7 @@ func (o *Orchestrator) DelegateIntent(ctx context.Context, in DelegateIntentInpu
 // delegation_context (no C2 binding) instead of a hard error, so
 // the harness's delegation loop never breaks (mirrors
 // mindset_apply's failure-mode contract).
-func (o *Orchestrator) prepareSubTask(ctx context.Context, st delegation.SubTask, operator string) (*DelegateSubTaskOutput, error) {
+func (o *Orchestrator) prepareSubTask(ctx context.Context, st delegation.SubTask, operator, sessionID string) (*DelegateSubTaskOutput, error) {
 	sub := &DelegateSubTaskOutput{
 		ID:        st.ID,
 		VibeCase:  st.VibeCase,
@@ -264,6 +278,7 @@ func (o *Orchestrator) prepareSubTask(ctx context.Context, st delegation.SubTask
 		Operator:        operator,
 		SubagentID:      subagentID,
 		TaskDescription: st.Task,
+		SessionID:       sessionID,
 	})
 	if err != nil {
 		// Best-effort: no delegation context, no C2 binding. The

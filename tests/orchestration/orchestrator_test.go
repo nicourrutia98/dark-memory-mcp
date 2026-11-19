@@ -350,8 +350,26 @@ func TestSessionClose_DoubleClose(t *testing.T) {
 	}
 }
 
-// O2: closing a session belonging to a different project returns
-// ErrNotFound (project filter blocks cross-project close).
+// O2: closing a session is SCOPED TO THE SESSION IT NAMES.
+//
+// The old version of this test asserted that closing a session of another
+// project fails, with the global slot standing for "another project". That
+// encoded the pre-SPEC-204 model, and SPEC-204 §10 changed it deliberately:
+//
+//	"Al resolver la sesión por id y no por el proyecto activo, nombrar la
+//	 sesión de otro proyecto pasa a ser una identidad válida para las 78
+//	 tools. Antes se rechazaba ('identity unavailable for this session')."
+//
+// The session id IS the credential (SPEC-204 §10). So the close is scoped to
+// the session it names, and the mutable global slot — shared by every client
+// of the MCP process — has no say in it. The old assertion was ALSO the
+// production bug: with the slot moved by another session, a session could
+// not be closed at all (MEDIDO 2026-11-18: 8 sessions stuck open, and the
+// Error Observatory full of "identity unavailable for this session").
+//
+// What SURVIVES of the old intent, asserted STRONGER: the close touches the
+// named session and nothing else, and its audit row lands in the session's
+// own project.
 func TestSessionClose_CrossProject(t *testing.T) {
 	ctx := context.Background()
 	orch, s := openOrchestratorTestEnv(t)
@@ -372,28 +390,61 @@ func TestSessionClose_CrossProject(t *testing.T) {
 		t.Fatalf("SessionStart: %v", err)
 	}
 
-	// Switch to globex; close from globex should fail.
+	// A session of the OTHER project, to prove the close does not touch it.
 	if err := s.SetActiveProject(ctx, "globex"); err != nil {
 		t.Fatalf("set globex: %v", err)
 	}
-	_, err = orch.SessionClose(ctx, orchestration.SessionCloseInput{SessionID: start.SessionID})
-	if err == nil {
-		t.Fatalf("expected error closing cross-project session")
-	}
-	if !errIs(err, store.ErrNotFound) {
-		t.Fatalf("expected ErrNotFound (project filter blocks), got: %v", err)
+	other, err := orch.SessionStart(ctx, orchestration.SessionStartInput{Operator: "nico", ProjectID: "globex"})
+	if err != nil {
+		t.Fatalf("SessionStart (globex): %v", err)
 	}
 
-	// Back in acme; close works.
-	if err := s.SetActiveProject(ctx, "acme"); err != nil {
-		t.Fatalf("set acme (back): %v", err)
+	// Switch to globex — another session moved the slot — and close the
+	// session of acme. It closes THAT session: the slot does not govern an
+	// operation that names the session (SPEC-204 §10).
+	if err := s.SetActiveProject(ctx, "globex"); err != nil {
+		t.Fatalf("set globex: %v", err)
 	}
 	out, err := orch.SessionClose(ctx, orchestration.SessionCloseInput{SessionID: start.SessionID})
 	if err != nil {
-		t.Fatalf("close from acme: %v", err)
+		t.Fatalf("close con el slot en otro proyecto: %v; el slot no gobierna una operacion que nombra la sesion (SPEC-204 §10)", err)
 	}
 	if out.SessionID != start.SessionID {
 		t.Fatalf("session id mismatch on close")
+	}
+
+	// The session of the other project is untouched.
+	if err := s.SetActiveProject(ctx, "globex"); err != nil {
+		t.Fatalf("set globex (back): %v", err)
+	}
+	otherGot, err := s.GetSession(ctx, other.SessionID)
+	if err != nil {
+		t.Fatalf("GetSession (la otra): %v", err)
+	}
+	if otherGot == nil {
+		t.Fatalf("la sesion del otro proyecto desaparecio: el cierre toco una sesion que no nombro")
+	}
+	if otherGot.Status != string(session.StatusOpen) {
+		t.Fatalf("la sesion del otro proyecto fue cerrada por un cierre que no la nombro, status=%s", otherGot.Status)
+	}
+
+	// And the audit row of the close landed in ACME, the session's project.
+	var auditProject string
+	err = s.RawDB().QueryRowContext(ctx,
+		`SELECT project_id FROM write_audit WHERE table_name = 'sessions' AND session_id = ? ORDER BY id DESC LIMIT 1`,
+		start.SessionID).Scan(&auditProject)
+	if err != nil {
+		t.Fatalf("leer la fila de auditoria del cierre: %v", err)
+	}
+	if auditProject != "acme" {
+		t.Fatalf("la fila de auditoria del cierre esta en el proyecto %q, se esperaba \"acme\"", auditProject)
+	}
+
+	// Closing twice is still ErrNotFound.
+	if _, err := orch.SessionClose(ctx, orchestration.SessionCloseInput{SessionID: start.SessionID}); err == nil {
+		t.Fatalf("expected error on second close")
+	} else if !errIs(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound on double-close, got: %v", err)
 	}
 }
 

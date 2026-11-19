@@ -86,6 +86,7 @@ func (s *Store) SavePlan(ctx context.Context, wc store.WriteContext, specID int6
 		}
 		return s.recordWriteLockedTx(ctx, tx, audit.WriteEvent{
 			TableName:       "vibe_specs",
+			ProjectID:       projectID,
 			RowID:           specID,
 			Actor:           wc.Actor,
 			SessionID:       nullStrOr(row.SessionID, wc.SessionID),
@@ -308,6 +309,7 @@ func (s *Store) ChargePlanCall(ctx context.Context, wc store.WriteContext, specI
 
 		return s.recordWriteLockedTx(ctx, tx, audit.WriteEvent{
 			TableName:       "vibe_specs",
+			ProjectID:       projectID,
 			RowID:           specID,
 			Actor:           wc.Actor,
 			SessionID:       nullStrOr(after.SessionID, wc.SessionID),

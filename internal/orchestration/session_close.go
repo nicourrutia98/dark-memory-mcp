@@ -70,12 +70,26 @@ func (o *Orchestrator) SessionClose(ctx context.Context, in SessionCloseInput) (
 		return nil, errMissingField("session_id")
 	}
 
+	// EL PROYECTO DE LA OPERACION: el de la sesion que se nombra.
+	//
+	// La sesion es la autoridad (SPEC-204 §10: "nombrar la sesion de otro
+	// proyecto pasa a ser una identidad valida"), y el slot global — un unico
+	// mutable compartido por todos los clientes del proceso MCP — NO
+	// gobierna una operacion que nombra su sesion.
+	//
+	// MEDIDO 2026-11-18: con el slot movido por otra sesion, el cierre
+	// fallaba con "identity unavailable for this session" y las sesiones se
+	// acumulaban abiertas. Se resuelve UNA vez y se usa en los cinco sitios
+	// que antes lo leian del slot.
+	projectID, err := o.resolveCallProject(ctx, "", in.SessionID)
+	if err != nil {
+		return nil, fmt.Errorf("session_close: resolve project: %w", err)
+	}
 	wc := store.WriteContext{
 		Actor:     "orchestrator_session_close",
 		SessionID: in.SessionID,
 		WritePath: "SessionClose",
-		// ProjectID is resolved by CloseSession via requireProject and
-		// projectIDOrActive; we don't have to set it.
+		ProjectID: projectID,
 	}
 	if err := o.Store.CloseSession(ctx, wc, in.SessionID, in.Reason); err != nil {
 		return nil, fmt.Errorf("session_close: close: %w", err)
@@ -90,7 +104,7 @@ func (o *Orchestrator) SessionClose(ctx context.Context, in SessionCloseInput) (
 	// close->open transitions as ErrNotFound on the identity
 	// frame, so the stale session_id won't accidentally authorize
 	// writes against the new state.
-	if err := o.Store.ClearActiveSession(ctx, o.Store.ActiveProject(), in.SessionID); err != nil {
+	if err := o.Store.ClearActiveSession(ctx, projectID, in.SessionID); err != nil {
 		// v2.11.0 (spec 757): capture in the Error Observatory —
 		// this was a silent-discard site. The close succeeded; a
 		// missed clear is a Warn-grade consistency miss.
@@ -101,11 +115,14 @@ func (o *Orchestrator) SessionClose(ctx context.Context, in SessionCloseInput) (
 	// session_start (within the 5s TTL) doesn't see the just-closed
 	// session_id. Same race as session_start's pre-inner buildGateInput.
 	if o.OnActiveSessionChanged != nil {
-		o.OnActiveSessionChanged(o.Store.ActiveProject())
+		o.OnActiveSessionChanged(projectID)
 	}
 
 	// Pull the closed session back to surface ClosedAt + status.
-	closedSess, err := o.Store.GetSession(ctx, in.SessionID)
+	// La lectura de vuelta va POR PROYECTO: GetSession esta acotada al
+	// proyecto activo (SPEC-204 §9, INV-7), y con el slot movido la
+	// sesion recien cerrada era invisible ("session vanished after close").
+	closedSess, err := o.Store.GetSessionInProject(ctx, projectID, in.SessionID)
 	if err != nil {
 		return nil, fmt.Errorf("session_close: get: %w", err)
 	}
@@ -127,12 +144,11 @@ func (o *Orchestrator) SessionClose(ctx context.Context, in SessionCloseInput) (
 	// indexed COUNT(*) queries. For a project with N runs, this drops
 	// the work from O(N) round-trips to O(1). Both queries hit the
 	// project_id index; O(log n) lookup, constant memory.
-	activeProject := o.Store.ActiveProject()
-	runsTotal, err := o.Store.CountRunsForProject(ctx, activeProject)
+	runsTotal, err := o.Store.CountRunsForProject(ctx, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("session_close: count runs: %w", err)
 	}
-	itemsTotal, err := o.Store.CountItemsForProject(ctx, activeProject)
+	itemsTotal, err := o.Store.CountItemsForProject(ctx, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("session_close: count items: %w", err)
 	}

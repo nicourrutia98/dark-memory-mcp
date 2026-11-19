@@ -385,6 +385,17 @@ type Store interface {
 	// SaveSession requires sess.ProjectID != "" (project isolation).
 	SaveSession(ctx context.Context, wc WriteContext, s *session.Session) (int64, error)
 	GetSession(ctx context.Context, sessionID string) (*session.Session, error)
+
+	// GetSessionInProject reads a session scoped to an EXPLICIT project.
+	// It does NOT depend on the mutable active-project slot, so a caller
+	// that knows the project of the session can read it back even when
+	// another client has moved the slot. Same pattern as
+	// GetAgentMemoryInProject.
+	//
+	//   - Row in the requested project -> (*Session, nil)
+	//   - Row in a different project   -> (nil, nil)
+	//   - Row does not exist           -> (nil, nil)
+	GetSessionInProject(ctx context.Context, projectID, sessionID string) (*session.Session, error)
 	// GetSessionByID returns the session row by id WITHOUT filtering by
 	// the active project (SPEC-203).
 	//
